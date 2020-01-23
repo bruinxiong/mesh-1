@@ -21,7 +21,7 @@ from __future__ import print_function
 
 import mesh_tensorflow as mtf
 from mesh_tensorflow.auto_mtf import valid_layouts
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class LayoutValidatorTest(tf.test.TestCase):
@@ -69,4 +69,5 @@ class LayoutValidatorTest(tf.test.TestCase):
 
 
 if __name__ == "__main__":
+  tf.disable_v2_behavior()
   tf.test.main()

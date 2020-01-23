@@ -29,7 +29,7 @@ from __future__ import print_function
 import collections
 import math
 import mesh_tensorflow as mtf
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 from tensorflow.core.framework import cost_graph_pb2
 
 

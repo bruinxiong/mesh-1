@@ -24,18 +24,17 @@ from absl.testing import parameterized
 import mesh_tensorflow as mtf
 import numpy as np
 
-from tensor2tensor.layers import common_layers
-
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+from tensorflow.python.framework import test_util  # pylint:disable=g-direct-tensorflow-import
 
 
 class LayersTest(parameterized.TestCase, tf.test.TestCase):
 
   @parameterized.parameters(
-      (4, True),
-      (8, False),
+      (4, True, "not_channels"),
+      (8, False, "channels"),
   )
-  def testDense(self, units, use_bias):
+  def testDense(self, units, use_bias, new_dim_name):
     batch = 2
     channels = 3
     inputs = tf.random_normal([batch, channels])
@@ -44,15 +43,16 @@ class LayersTest(parameterized.TestCase, tf.test.TestCase):
     mesh = mtf.Mesh(graph, "my_mesh")
     batch_dim = mtf.Dimension("batch", batch)
     channels_dim = mtf.Dimension("channels", channels)
-    depth_dim = mtf.Dimension("depth", units)
+    new_dim = mtf.Dimension(new_dim_name, units)
 
     mtf_inputs = mtf.import_tf_tensor(
         mesh, inputs, shape=mtf.Shape([batch_dim, channels_dim]))
-    mtf_outputs = mtf.layers.dense(mtf_inputs,
-                                   output_dim=depth_dim,
-                                   reduced_dims=[channels_dim],
-                                   activation=mtf.relu,
-                                   use_bias=use_bias)
+    mtf_outputs = mtf.layers.dense(
+        mtf_inputs,
+        new_dims=new_dim,
+        reduced_dims=[channels_dim],
+        activation=mtf.relu,
+        use_bias=use_bias)
     mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
         shape=[], layout={}, devices=[""])
     lowering = mtf.Lowering(graph, {mesh: mesh_impl})
@@ -69,7 +69,7 @@ class LayersTest(parameterized.TestCase, tf.test.TestCase):
 
     self.assertEqual(actual.shape, expected.shape)
 
-  @tf.contrib.eager.run_test_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes()
   def testLayerNorm(self):
     batch = 2
     channels = 3
@@ -89,7 +89,7 @@ class LayersTest(parameterized.TestCase, tf.test.TestCase):
     lowering = mtf.Lowering(graph, {mesh: mesh_impl})
     actual_outputs = lowering.export_to_tf_tensor(mtf_outputs)
 
-    expected_outputs = common_layers.layer_norm(inputs)
+    expected_outputs = tf.keras.layers.LayerNormalization()(inputs)
     tf_group = lowering.copy_masters_to_slices()
     init = tf.global_variables_initializer()
     self.evaluate(init)
@@ -98,7 +98,7 @@ class LayersTest(parameterized.TestCase, tf.test.TestCase):
 
     self.assertEqual(actual.shape, expected.shape)
 
-  @tf.contrib.eager.run_test_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes()
   def testBatchNorm(self):
     batch = 2
     channels = 3
@@ -138,7 +138,7 @@ class LayersTest(parameterized.TestCase, tf.test.TestCase):
     self.assertAllClose(actual_0, expected)
     self.assertAllClose(actual_1, expected)
 
-  @tf.contrib.eager.run_test_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes()
   def testWeightsNonzero(self):
     inputs = tf.constant([[3, 1, 0], [1, 0, 0]])
 
@@ -155,14 +155,14 @@ class LayersTest(parameterized.TestCase, tf.test.TestCase):
     lowering = mtf.Lowering(graph, {mesh: mesh_impl})
     actual_outputs = lowering.export_to_tf_tensor(mtf_outputs)
 
-    expected_outputs = common_layers.weights_nonzero(inputs)
+    expected_outputs = tf.cast(tf.not_equal(inputs, 0), tf.float32)
     tf_group = lowering.copy_masters_to_slices()
     self.evaluate(tf_group)
     actual, expected = self.evaluate([actual_outputs, expected_outputs])
 
     self.assertAllEqual(actual, expected)
 
-  @tf.contrib.eager.run_test_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes()
   def testDenseReluDense(self):
     batch = 2
     channels = 3
@@ -417,4 +417,6 @@ class LayersTest(parameterized.TestCase, tf.test.TestCase):
       self.assertAllClose(actual, expected)
 
 if __name__ == "__main__":
+  tf.disable_v2_behavior()
+  tf.enable_eager_execution()
   tf.test.main()

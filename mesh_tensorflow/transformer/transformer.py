@@ -48,10 +48,11 @@ from __future__ import division
 from __future__ import print_function
 
 import json
+
 import gin
 import mesh_tensorflow as mtf
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class TransformerLayer(object):
@@ -346,7 +347,7 @@ class LayerStack(TransformerLayer):
   def _dropout(self, context, x):
     if context.train and self._dropout_rate > 0:
       return mtf.dropout(
-          x, keep_prob=1.0 - self._dropout_rate,
+          x, rate=self._dropout_rate,
           noise_shape=mtf.Shape(context.batch_dims + [context.model.model_dim]))
     else:
       return x
@@ -409,7 +410,8 @@ class Unitransformer(object):
                positional_embedding=True,
                input_full_attention=False,
                loss_on_targets_only=False,
-               loss_denominator=None):
+               loss_denominator=None,
+               token_dropout_rate=0.0):
     """Create a Unitransformer.
 
     Args:
@@ -450,6 +452,7 @@ class Unitransformer(object):
         batch size than the original training batch, one might want to use the
         same denominator as was used for the pretraining.  This complication
         might be avoided by always using loss_denominator = 1.0.
+      token_dropout_rate: an optional floating point value
     """
     self.layer_stack = layer_stack
     self.model_dim = mtf.Dimension("d_model", d_model)
@@ -485,6 +488,7 @@ class Unitransformer(object):
     if self.input_full_attention and not self.autoregressive:
       raise ValueError(
           "input_full_attention only makes sense with autoregressive")
+    self.token_dropout_rate = token_dropout_rate
 
   @property
   def fully_autoregressive(self):
@@ -543,12 +547,18 @@ class Unitransformer(object):
         targets = mtf.broadcast(
             targets, [self.ensemble_dim] + targets.shape.dims)
     if "embedding" in context.shared_params:
-      embedding_weights = context.shared_params["embedding"]
+      vocab_embedding = context.shared_params["embedding"]
     else:
-      embedding_weights = mtf.layers.embedding_weights(
-          mesh, self.input_vocab_dim, self.model_dim, context.variable_dtype,
-          name="embedding", ensemble_dim=self.ensemble_dim)
-    x = mtf.gather(embedding_weights, inputs, self.input_vocab_dim)
+      vocab_embedding = get_vocab_embedding_cls()(
+          mesh,
+          self.input_vocab_dim,
+          self.model_dim,
+          context.variable_dtype,
+          name="embedding",
+          ensemble_dim=self.ensemble_dim)
+    if context.train:
+      inputs = mtf.dropout(inputs, rate=self.token_dropout_rate)
+    x = vocab_embedding.ids_to_embedding(inputs)
     if self.positional_embedding:
       if "positional_embedding" in context.shared_params:
         pos_emb_var = context.shared_params["positional_embedding"]
@@ -584,13 +594,12 @@ class Unitransformer(object):
     if self.output_vocab_dim is None:
       return x
     if self.shared_embedding_and_softmax_weights:
-      logits = mtf.einsum(
-          [x * (self.model_dim.size ** -0.5), embedding_weights],
-          reduced_dims=[self.model_dim])
+      logits = vocab_embedding.hidden_to_logits(x)
     else:
       logits = mtf.layers.dense(
           x, self.output_vocab_dim, use_bias=False,
           variable_dtype=context.variable_dtype,
+          reduced_dims=x.shape.dims[-1:],
           name="logits")
     if targets is not None and context.losses is not None:
       context.losses.append(
@@ -740,7 +749,8 @@ class Unitransformer(object):
                             encoder_layer_outputs=None,
                             never_end=False,
                             remove_partial_sequences=False,
-                            sampling_keep_top_k=-1):
+                            sampling_keep_top_k=-1,
+                            bos_id=0):
     """Sample randomly one token at a time.
 
     The partial_sequences represent partial sequences to be continued.  The
@@ -771,6 +781,7 @@ class Unitransformer(object):
         sequences from the output
       sampling_keep_top_k: an integer - if not -1, only sample from the top k
         logits.
+      bos_id: beginning of sequence id
 
     Returns:
       a Tensor with shape [<batch_dims>, length_dim]
@@ -849,6 +860,10 @@ class Unitransformer(object):
     def body_fn(position, ids, *states):
       """One step in the decode loop."""
       inputs_this_step = mtf.gather(ids, position - 1, length_dim)
+      # Setting proper bos_id for position == 0. No-op otherwise.
+      if bos_id:
+        inputs_this_step += bos_id * mtf.ones_like(inputs_this_step) * mtf.cast(
+            mtf.equal(position, 0), tf.int32)
       context_incremental = Context(
           model=self,
           mesh=inputs.mesh,
@@ -885,8 +900,9 @@ class Unitransformer(object):
       if sampling_keep_top_k != -1:
         if sampling_keep_top_k <= 0:
           raise ValueError("sampling_keep_top_k must either be -1 or positive.")
-        k_largest = mtf.nth_smallest_element(
-            logits, n=sampling_keep_top_k, reverse=True)
+        k_largest = mtf.nth_largest_element(
+            logits, n=sampling_keep_top_k,
+            reduced_dim=self.output_vocab_dim)
         logits = mtf.where(mtf.less_equal(logits, k_largest),
                            mtf.ones_like(logits)*-1e6, logits)
 
@@ -918,7 +934,8 @@ class Unitransformer(object):
                   encoder_inputs=None,
                   alpha=0.6,
                   shared_params=None,
-                  encoder_layer_outputs=None):
+                  encoder_layer_outputs=None,
+                  bos_id=0):
     """Beam search.
 
     Args:
@@ -933,6 +950,7 @@ class Unitransformer(object):
       shared_params: an optional dictionary
       encoder_layer_outputs: optional - readonly list of tensor activations when
         decoding, one per each input layer + the embedding layer
+      bos_id: beginning of sequence id
 
     Returns:
       a Tensor with shape [<batch_dims>, beam_dim, length_dim]
@@ -994,6 +1012,10 @@ class Unitransformer(object):
     def logits_fn(step_num, ids, states):
       """logits_fn for mtf.beam_search.beam_search()."""
       inputs_this_step = mtf.gather(ids, step_num - 1, length_dim)
+      # Setting proper bos_id for step_num == 0. No-op otherwise.
+      if bos_id:
+        inputs_this_step += bos_id * mtf.ones_like(inputs_this_step) * mtf.cast(
+            mtf.equal(step_num, 0), tf.int32)
       context_incremental = Context(
           model=self,
           mesh=inputs.mesh,
@@ -1030,6 +1052,33 @@ class Unitransformer(object):
         layout=self.layout)
     return mtf.gather(
         beams, mtf.constant(inputs.mesh, 0, dtype=tf.int32), beam_dim)
+
+
+@gin.configurable
+def shift_targets(targets, bos_id=0, eos_id=1):
+  """Transforms decoder labels to decoder inputs.
+
+  Args:
+    targets: decoder labels
+    bos_id: begin of sequence id, defaults to 0
+    eos_id: end of sequence id, defaults to 1
+
+  Returns:
+    Decoder inputs.
+  """
+  length_dim = targets.shape.dims[-1]
+  shifted_targets = mtf.shift(targets, offset=1, dim=length_dim, wrap=False)
+  # We should have a 0 at the beginning of each sequence rather than the
+  # shifted EOS (e.g. 1) from the previous sequence.
+  shifted_targets *= mtf.to_int32(mtf.not_equal(shifted_targets, eos_id))
+
+  if bos_id:
+    shifted_targets += mtf.to_int32(
+        mtf.logical_and(
+            mtf.equal(shifted_targets, 0),
+            mtf.not_equal(targets, 0))) * bos_id
+
+  return shifted_targets
 
 
 @gin.configurable
@@ -1076,7 +1125,7 @@ class Bitransformer(object):
           raise ValueError(
               "shared_embedding requires encoder and decoder to have identical"
               " d_model and vocabulary sizes")
-        shared_params["embedding"] = mtf.layers.embedding_weights(
+        shared_params["embedding"] = get_vocab_embedding_cls()(
             mesh,
             self.encoder.input_vocab_dim,
             self.encoder.model_dim,
@@ -1139,13 +1188,9 @@ class Bitransformer(object):
     if encoder_sequence_id is not None:
       encoder_sequence_id = mtf.layers.rename_length_to_memory_length(
           encoder_sequence_id)
-    length_dim = targets.shape.dims[-1]
-    shifted_targets = mtf.shift(targets, offset=1, dim=length_dim, wrap=False)
-    # We should have a 0 at the beginning of each sequence rather than the
-    # shifted EOS (1) from the previous sequence.
-    shifted_targets -= mtf.to_int32(mtf.equal(shifted_targets, 1))
+
     logits, loss = self.decoder.call_simple(
-        shifted_targets,
+        shift_targets(targets),
         targets,
         compute_loss,
         mode=mode,
@@ -1397,11 +1442,22 @@ class StudentTeacher(object):
 def make_layer_stack(layers=gin.REQUIRED, num_layers=6, block_scope=True):
   """Configurable layer stack.
 
+  The "layers" argument specifies the layers in each block.  It is a list
+  of specifications.  Each specification is either a subclass of
+  TransformerLayer or a list/tuple containing such a subclass as well as other
+  optional items.  Each optional item is either a string (the class name), or
+  a dictionary of kwargs to be passed to the class constructor.
+  Example:
+  layers=[
+    transformer_layers.SelfAttention,
+    [transformer_layers.DenseReluDense,
+     "feedforward", {"hidden_size": 2048, "dropout_rate":0.2}],
+  ]
+
+  The "num_layers" argument specifies the number of blocks.
+
   Args:
-    layers: a list of subclasses of TransformerLayer, or a list of tuples. If an
-      entry of this list is a tuple, the first entry of the tuple is assumed to
-      be the layer name (string) and the second entry is a subclass of
-      TransformerLayer.
+    layers: a list (see above)
     num_layers: an integer
     block_scope: a bool, if True then use scopes of the format
       ```
@@ -1425,12 +1481,21 @@ def make_layer_stack(layers=gin.REQUIRED, num_layers=6, block_scope=True):
   for block in range(num_layers):
     for n, cls in enumerate(layers):
       # Set name to None if it wasn't provided which simplifies the logic below
-      name, cls = cls if isinstance(cls, (list, tuple)) else (None, cls)
+      name = None
+      kwargs = {}
+      if isinstance(cls, (list, tuple)):
+        for x in cls:
+          if isinstance(x, str):
+            name = x
+          elif isinstance(x, dict):
+            kwargs = x
+          else:
+            cls = x
       if block_scope:
         name = "block_{:03d}/{}".format(block, name or "layer_{:03d}".format(n))
       else:
         name = name or "layer_{:03d}".format(len(layer_stack))
-      layer = cls()
+      layer = cls(**kwargs)
       layer.set_name(name)
       layer_stack.append(layer)
   return LayerStack(layer_stack)
@@ -1606,4 +1671,53 @@ def reduce_ensemble_logits(logits, ensemble_dim, vocab_dim,
   """
   return reduce_fn(logits, ensemble_dim, vocab_dim)
 
+
+@gin.configurable
+class VocabEmbedding(object):
+  """A class to go from vocab ids to model states and model states to logits."""
+
+  def __init__(self, mesh, vocab_dim, output_dim, variable_dtype, name,
+               ensemble_dim):
+    """Embedding for the vocabulary.
+
+    Most of the arguments get passed to `mtf.layers.embedding_weights`.
+
+    Args:
+      mesh: a mtf.Mesh
+      vocab_dim: a mtf.Dimension
+      output_dim: a mtf.Dimension
+      variable_dtype: a mtf.VariableDType
+      name: a string
+      ensemble_dim: a mtf.Dimension
+    """
+    self._vocab_dim = vocab_dim
+    self._output_dim = output_dim
+    self._embedding_weights = mtf.layers.embedding_weights(
+        mesh=mesh,
+        vocab_dim=vocab_dim,
+        output_dim=output_dim,
+        variable_dtype=variable_dtype,
+        name=name,
+        ensemble_dim=ensemble_dim)
+
+  def ids_to_embedding(self, ids):
+    return mtf.gather(self._embedding_weights, ids, self._vocab_dim)
+
+  def hidden_to_logits(self, hidden):
+    hidden *= self._output_dim.size**-0.5
+    return mtf.einsum([hidden, self._embedding_weights],
+                      reduced_dims=[self._output_dim])
+
+
+@gin.configurable
+def get_vocab_embedding_cls(cls=VocabEmbedding):
+  """Configurable function to get the class to use for vocab embeddings.
+
+  Args:
+    cls: a class implementing the interface of mtf.transformer VocabEmbedding
+
+  Returns:
+    the class
+  """
+  return cls
 

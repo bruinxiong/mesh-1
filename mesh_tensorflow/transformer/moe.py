@@ -30,7 +30,7 @@ import gin
 import mesh_tensorflow as mtf
 from mesh_tensorflow.transformer import transformer
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 @gin.configurable
@@ -48,8 +48,10 @@ class MoE1D(transformer.TransformerLayer):
                second_policy_train="random",
                second_policy_eval="random",
                second_threshold_train=0.2,
-               second_threshold_eval=0.2):
-    self._hparams = tf.contrib.training.HParams(
+               second_threshold_eval=0.2,
+               dropout_rate=0.0,
+               activation="relu"):
+    self._hparams = HParams(
         moe_gating="top_2",
         moe_num_experts=num_experts,
         moe_loss_coef=loss_coef,
@@ -61,22 +63,14 @@ class MoE1D(transformer.TransformerLayer):
         moe_second_policy_train=second_policy_train,
         moe_second_policy_eval=second_policy_eval,
         moe_second_threshold_train=second_threshold_train,
-        moe_second_threshold_eval=second_threshold_eval)
+        moe_second_threshold_eval=second_threshold_eval,
+        moe_dropout_rate=dropout_rate)
+    self._activation = activation
 
   def call(self, context, x, losses=None):
     """Call the layer."""
     if context.model.ensemble_dim:
       raise NotImplementedError("MoE not yet implemented with ensembles")
-
-    # Dim cheat sheet:
-    # <B>: batch dims, e.g.
-    #   [outer_batch_size, batch_size] or
-    #   [beam_size, batch_size]
-    # L: original length
-    # M: model dim
-    #
-    # x
-    #   <B>LM Tensor
 
     has_length_dim = context.length_dim in x.shape.dims
     if not has_length_dim:
@@ -93,7 +87,8 @@ class MoE1D(transformer.TransformerLayer):
         context.variable_dtype,
         layout=context.model.layout,
         mesh_shape=context.model.mesh_shape,
-        nonpadding=context.nonpadding)
+        nonpadding=context.nonpadding,
+        activation=self._activation)
     if context.losses is not None:
       context.losses.append(loss)
     if not has_length_dim:
@@ -118,7 +113,7 @@ class MoE2D(transformer.TransformerLayer):
                second_policy_eval="random",
                second_threshold_train=0.2,
                second_threshold_eval=0.2):
-    self._hparams = tf.contrib.training.HParams(
+    self._hparams = HParams(
         moe_gating="top_2",
         moe_num_experts=[expert_x, expert_y],
         moe_loss_coef=loss_coef,
@@ -162,7 +157,7 @@ class MoE2D(transformer.TransformerLayer):
 
 def transformer_moe_layer_v1(
     inputs, output_dim, hparams, train, variable_dtype,
-    layout=None, mesh_shape=None, nonpadding=None):
+    layout=None, mesh_shape=None, nonpadding=None, activation=mtf.relu):
   """Local mixture of experts that works well on TPU.
 
   Adapted from the paper https://arxiv.org/abs/1701.06538
@@ -215,7 +210,7 @@ def transformer_moe_layer_v1(
   different code for the experts themselves.
 
   Dimensions cheat sheet:
-  <B>: batch dims
+  B: batch dim(s)
   L: original sequence length
   M: input depth
   N: output depth
@@ -223,29 +218,73 @@ def transformer_moe_layer_v1(
   S: group size
   E: number of experts
   C: expert capacity
-  (u for unsplit dims)
 
   Args:
-    inputs: a mtf.Tensor with shape [<batch_dims...>, length_dim, input_dim]
+    inputs: a mtf.Tensor with shape [batch_dim(s), length_dim, input_dim]
     output_dim: a mtf.Dimension (for Transformer, this is input_dim)
     hparams: model hyperparameters
     train: a boolean
     variable_dtype: a mtf.VariableDType
     layout: optional - an input to mtf.convert_to_layout_rules
     mesh_shape: optional - an input to mtf.convert_to_shape
-    nonpadding: an optional Tensor with shape [<batch_dims>, length_dim]
+    nonpadding: an optional Tensor with shape [batch_dim(s), length_dim]
       and the same dtype as inputs, consisting of ones(nonpadding)
       and zeros(padding).
+    activation: a function.
 
   Returns:
-    outputs: a Tensor with shape [<batch_dims...>, length_dim, output_dim]
+    outputs: a Tensor with shape [batch_dim(s), length_dim, output_dim]
     loss: a mtf scalar
 
   Raises:
     ValueError: on unrecognized hparams.moe_gating
   """
-  # See "Dimensions cheat sheet"
-  # <B>LM Tensor
+  # pylint: disable=line-too-long
+  #
+  # O outer_batch dimension can be used for expert replication, e.g.
+  # outer_batch=4 for placing 128 experts on 512 cores with 4 replicas of each
+  # expert.
+  #
+  # E.g. 16x16 basic example:
+  #   moe_num_experts=512, num_groups=1024, batch=4096, length=256, d_model=1024
+  # ---
+  # Below ` indicates common way of splitting along mesh dimension.
+  #
+  # orig_inputs      OB`LM Tensor
+  #                  Shape[outer_batch=1, batch=4096, length=256, d_model=1024]
+  #                  v (reshaped)
+  # inputs           OG`SM
+  #                  Shape[outer_batch=1, batch=1024, group=1024, d_model=1024]
+  #
+  # combine_tensor,
+  # dispatch_tensor  OG`SEC
+  #                  Shape[outer_batch=1, batch=1024, group=1024, expert_unsplit=512, expert_capacity=4]
+  #
+  # (dispatched inputs)
+  # expert_inputs    OEG`CM
+  #                  Shape[outer_batch=1, expert_unsplit=512, batch=1024, expert_capacity=4, d_model=1024]
+  #                  v (re-split via ReshapeOperation)
+  #                  OE`GCM
+  #                  Shape[outer_batch=1, experts=512, batch_unsplit=1024, expert_capacity=4, d_model=1024]
+  #
+  # (hidden representation)
+  # h                OE`GCH
+  #                  Shape[outer_batch=1, experts=512, batch_unsplit=1024, expert_capacity=4, expert_hidden=8192]
+  #
+  # expert_output    OE`GCM
+  #                  Shape[outer_batch=1, experts=512, batch_unsplit=1024, expert_capacity=4, d_model=1024]
+  #                  v (re-split via ReshapeOperation)
+  #                  OEG`CM
+  #                  Shape[outer_batch=1, expert_unsplit=512, batch=1024, expert_capacity=4, d_model=1024]
+  #
+  # (combined expert_output)
+  # output           OG`SM
+  #                  Shape[outer_batch=1, batch=1024, group=1024, d_model=1024
+  #                  v (reshape)
+  #                  OB`LM
+  #                  Shape[outer_batch=1, batch=4096, length=256, d_model=1024]
+  #
+  # pylint: enable=line-too-long
   orig_inputs = inputs
   hidden_dim = mtf.Dimension("expert_hidden", hparams.moe_hidden_size)
   experts_dim = mtf.Dimension("experts", hparams.moe_num_experts)
@@ -303,8 +342,9 @@ def transformer_moe_layer_v1(
         inputs.mesh, batch_and_length_dims, dtype=inputs.dtype) + nonpadding
     nonpadding = mtf.reshape(nonpadding, moe_input_dims[:-1])
   if hparams.moe_gating == "top_2":
-    # dispatch_tensor and combine_tensor are
-    # <B>GSEC Tensors
+    # combine_tensor,
+    # dispatch_tensor  OG`SEC Tensors
+    # (G is generally split along mesh dim)
     dispatch_tensor, combine_tensor, loss = _top_2_gating(
         inputs=inputs,
         outer_expert_dims=None,
@@ -331,14 +371,20 @@ def transformer_moe_layer_v1(
       ]))
 
   # Now feed the expert inputs through the experts.
-  h = mtf.layers.dense(
-      expert_inputs, hidden_dim, expert_dims=[experts_dim],
-      activation=mtf.relu, use_bias=False,
+  h = mtf.layers.dense_product(
+      expert_inputs,
+      reduced_dims=expert_inputs.shape.dims[-1:],
+      new_dims=[hidden_dim],
+      expert_dims=[experts_dim],
+      activation_functions=activation, use_bias=False,
       variable_dtype=variable_dtype, name="wi")
+
+  if train and hparams.moe_dropout_rate != 0.0:
+    h = mtf.dropout(h, 1.0 - hparams.moe_dropout_rate)
 
   expert_output = mtf.layers.dense(
       h, output_dim, expert_dims=[experts_dim], use_bias=False,
-      variable_dtype=variable_dtype,
+      reduced_dims=h.shape.dims[-1:], variable_dtype=variable_dtype,
       name="wo")
 
   expert_output = mtf.reshape(
@@ -595,10 +641,12 @@ def transformer_moe_layer_v2(
 
   hidden_output = mtf.layers.dense(
       expert_inputs_y, hidden_dim, expert_dims=[y0, x1],
+      reduced_dims=expert_inputs_y.shape.dims[-1:],
       activation=mtf.relu, use_bias=False, variable_dtype=variable_dtype,
       name="wi")
   expert_output = mtf.layers.dense(
       hidden_output, output_dim, expert_dims=[y0, x1],
+      reduced_dims=hidden_output.shape.dims[-1:],
       use_bias=False, variable_dtype=variable_dtype,
       name="wo")
 
@@ -862,7 +910,7 @@ def set_default_moe_hparams(hparams):
 
 
 def _split_into_groups(n, max_group_size, mesh_dim_size):
-  """Helper function for figuring out how to split a dimensino into groups.
+  """Helper function for figuring out how to split a dimension into groups.
 
   We have a dimension with size n and we want to split it into
   two dimensions: n = num_groups * group_size
@@ -895,3 +943,17 @@ def _split_into_groups(n, max_group_size, mesh_dim_size):
       " = (num_groups=%d group_size=%d)" %
       (n, max_group_size, mesh_dim_size, num_groups, group_size))
   return num_groups, group_size
+
+
+class HParams(object):
+  """Replacement for tf.contrib.training.HParams.
+
+  TODO(noam): remove this class and rewrite the methods in this file.
+  """
+
+  def __init__(self, **kwargs):
+    for k, v in kwargs.items():
+      setattr(self, k, v)
+
+  def add_hparam(self, k, v):
+    setattr(self, k, v)

@@ -26,15 +26,15 @@ import os
 import re
 
 from mesh_tensorflow import utils
+import numpy as np
 import six
 from six.moves import xrange  # pylint: disable=redefined-builtin
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 # pylint: disable=g-direct-tensorflow-import
 from tensorflow.python.ops.gen_nn_ops import conv3d_backprop_input_v2
 from tensorflow.python.ops.nn_ops import conv3d_backprop_filter_v2
-
 
 Dimension = collections.namedtuple("Dimension", ["name", "size"])
 
@@ -1046,7 +1046,7 @@ class MeshImpl(object):
     Returns:
       a LaidOutTensor
     """
-    raise NotImplementedError("Alltoall not implemented")
+    raise NotImplementedError("Receive not implemented")
 
   def shift_by_n_processors(self, x, mesh_axis, offset, wrap):
     """Receive the slice from processor pcoord - offset.
@@ -1218,6 +1218,8 @@ class MeshImpl(object):
     Args:
       equation: a string
       *slices: a list of tf.Tensor
+    Returns:
+      a Tensor
     """
     return tf.einsum(equation, *slices)
 
@@ -1716,6 +1718,26 @@ def negative(x, name="negative"):
 
 def logical_not(x, name="logical_not"):
   return cwise(tf.logical_not, [x], name=name)
+
+
+def swish(x):
+  """Swish activation from https://arxiv.org/abs/1710.05941 ."""
+  return x * sigmoid(x)
+
+
+def gelu(x):
+  """Gaussian Error Linear Unit.
+
+  This is a smoother version of the RELU.
+  Original paper: https://arxiv.org/abs/1606.08415
+  Args:
+    x: float Tensor to perform activation.
+
+  Returns:
+    `x` with the GELU activation applied.
+  """
+  cdf = 0.5 * (1.0 + tanh((np.sqrt(2 / np.pi) * (x + 0.044715 * x * x * x))))
+  return x * cdf
 
 
 def reciprocal(x, name="reciprocal"):
@@ -3822,8 +3844,12 @@ class Variable(Operation):
     if not isinstance(self, StackedVariable):
       with tf.device(mesh.variable_placer_fn), utils.outside_all_rewrites():
         self._master = tf.get_variable(
-            name, shape.to_integer_list, dtype=self.master_dtype,
-            initializer=initializer, **kwargs)
+            name,
+            shape.to_integer_list,
+            dtype=self.master_dtype,
+            initializer=initializer,
+            trainable=trainable,
+            **kwargs)
       self._name = self._master.name[:self._master.name.find(":")]
     self._outputs = [Tensor(self, shape, dtype.activation_dtype)]
 
@@ -3861,6 +3887,10 @@ class Variable(Operation):
   @property
   def shape(self):
     return self.value.shape
+
+  @property
+  def size(self):
+    return self.shape.size
 
   @property
   def dtype(self):
@@ -3990,6 +4020,11 @@ def get_variable(mesh, name, shape, dtype=tf.float32,
     full_name = scope_name + "/" + name
   else:
     full_name = name
+  if initializer is None:
+    tf.logging.warning(
+        "Using default tf glorot_uniform_initializer for variable %s "
+        " The initialzer will guess the input and output dimensions "
+        " based on dimension order."  % full_name)
   if full_name in mesh.graph.name_to_variable:
     var = mesh.graph.name_to_variable[full_name]
   else:
@@ -4085,8 +4120,9 @@ class Depend(Operation):
   def __init__(self, x, dependencies, name=None):
     super(Depend, self).__init__([x], x.mesh, name=name or "depend")
     for d in dependencies:
-      if not isinstance(d, Operation):
-        raise ValueError("dependencies must be mtf.Operations. got %s" % d)
+      if not isinstance(d, Operation) and not isinstance(d, Tensor):
+        raise ValueError("dependencies must be mtf.Operations or mtf.Tensor."
+                         "got %s" % d)
     self._dependencies = dependencies
     self._outputs = [Tensor(self, x.shape, x.dtype)]
 
@@ -4094,8 +4130,15 @@ class Depend(Operation):
     mesh_impl = lowering.mesh_impl(self)
     if not mesh_impl.supports_control_dependencies:
       raise ValueError("Mesh does not suppport control dependencies.")
-    with tf.control_dependencies(
-        [lowering.operations[d] for d in self._dependencies]):
+
+    control_inputs = []
+    for d in self._dependencies:
+      if isinstance(d, Operation):
+        control_inputs.append(lowering.operations[d])
+      else:
+        control_inputs.append(lowering.tensors[d].tensor_list)
+
+    with tf.control_dependencies(tf.nest.flatten(control_inputs)):
       lowering.set_tensor_lowering(
           self.outputs[0],
           mesh_impl.slicewise(tf.identity,
@@ -4110,7 +4153,7 @@ def depend(x, dependencies):
 
   Args:
     x: a Tensor
-    dependencies: a list of Operations
+    dependencies: a list of Operations or Tensors
   Returns:
     an tensor
   """
@@ -4973,6 +5016,8 @@ def gather(weights, indices, dim, output_shape=None):
   dim = convert_to_dimension(dim)
   output_shape = convert_to_shape(output_shape)
   if not isinstance(indices, Tensor):
+    # TODO(noam): when `indices` is an integer, gather can be implemented
+    #   more directly with mtf_slice() and reshape()
     indices = constant(weights.mesh, indices, dtype=tf.int32)
   if weights.dtype == tf.bool:
     return cast(gather(to_float(weights), indices, dim, output_shape), tf.bool)
@@ -5538,18 +5583,31 @@ def random_uniform(mesh, shape, **kwargs):
   return RandomOperation(mesh, shape, tf.random.uniform, **kwargs).outputs[0]
 
 
-def dropout(x, keep_prob, noise_shape=None, name=None):
-  """Dropout layer.
+def dropout(x, keep_prob=None, rate=None, noise_shape=None, name=None):
+  """Randomly set some elements to 0 and scale up the rest.
+
+  Dropout rate should be specified in exactly one of two ways:
+    rate - the fraction to drop
+    keep_prob - the fraction to keep
+
+  If x has floating-point type, then kept values are scaled up by
+  a factor of (1.0 / keep_prob).  If x is has integer type, the kept values
+  are not scaled up.
 
   Args:
     x: a Tensor
     keep_prob: a float between 0.0 and 1.0
+    rate: a float between 0.0 and 1.0
     noise_shape: an optional Shape (a subset of x.shape)
     name: an optional string
 
   Returns:
     a Tensor
   """
+  if (keep_prob is None) == (rate is None):
+    raise ValueError("exactly one of keep_prob and rate should be set")
+  if keep_prob is None:
+    keep_prob = 1.0 - rate
   noise_shape = convert_to_shape(noise_shape)
   if noise_shape is None:
     noise_shape = x.shape
@@ -5557,8 +5615,11 @@ def dropout(x, keep_prob, noise_shape=None, name=None):
     if keep_prob == 1.0:
       return x
     noise = cast(less(random_uniform(
-        x.mesh, noise_shape, dtype=x.dtype), keep_prob), x.dtype)
-    noise /= keep_prob
+        x.mesh, noise_shape,
+        dtype=(x.dtype if x.dtype.is_floating else tf.float32)),
+                      keep_prob), x.dtype)
+    if x.dtype.is_floating:
+      noise /= keep_prob
     return x * noise
 
 
@@ -6087,60 +6148,24 @@ def serialize_training_step(features, model_fn, batch_dim, num_splits):
   return combined_grads, combined_outputs
 
 
-class NthSmallestElementOperation(Operation):
-  """Reduce out last dimension - output is nth-smallest (or largest) element.
-
-  TODO(noam): make n a tensor instead of an integer
-  """
-
-  def __init__(self, x, n, reverse, name=None):
-    super(NthSmallestElementOperation, self).__init__(
-        [x], name=name or "nth_element")
-    reduced_dim = x.shape.dims[-1]
-    output_shape = x.shape - reduced_dim
-    self._outputs = [Tensor(self, output_shape, x.dtype)]
-    self._n = n
-    self._initialize_splittable_and_unsplittable_dims(
-        "splittable", [reduced_dim])
-    self._reverse = reverse
-
-  def gradient(self, grad_ys):
-    raise NotImplementedError("TODO(noam): implement gradient")
-
-  def lower(self, lowering):
-    mesh_impl = lowering.mesh_impl(self)
-    def slicewise_fn(x):
-      return tf.contrib.nn.nth_element(x, self._n, reverse=self._reverse)
-    y = mesh_impl.slicewise(slicewise_fn, lowering.tensors[self.inputs[0]])
-    lowering.set_tensor_lowering(self.outputs[0], y)
-
-
-def nth_smallest_element(x, n, reduced_dim=None, reverse=False, name=None):
-  """Nth-smallest (or largest) reduction on specified axis.
+def nth_largest_element(x, n, reduced_dim, name=None):
+  """Nth-largest reduction on specified axis.
 
   Note that n is zero-indexed.
-
-  In the case that reduced_dim is split, we do something inefficient:
-    shift data around so that it is replicated and do the computation
-    everywhere.
 
   Args:
     x: a Tensor
     n: an integer
-    reduced_dim: an optional Dimension - defaults to the last dimension of n
-    reverse: a boolean
+    reduced_dim: a Dimension
     name: an optional string
   Returns:
     a Tensor
   """
-  if reduced_dim is None:
-    reduced_dim = x.shape.dims[-1]
-  # remove the reduced dimension from the shape and insert it at the end
-  x = transpose(x, x.shape - reduced_dim + reduced_dim)
-  # Since the NthSmallestElementOperation does not know how to reduce over a
-  # split dimension, we rename the reduced dimension so that we ensure that it
-  # is not split.  This may cause the tensor to get all-concatenated, causing
-  # redundant computation.
-  unsplit_dim = Dimension("_unsplit", reduced_dim.size)
-  x = replace_dimensions(x, reduced_dim, unsplit_dim)
-  return NthSmallestElementOperation(x, n, reverse, name).outputs[0]
+  # Compute the top k=n+1 values, then take the last one.
+  k_dim = Dimension("_top_k_", n + 1)
+  values, _ = top_k(x, reduced_dim=reduced_dim, k_dim=k_dim, name=name)
+  return gather(values, n, k_dim)
+
+
+def nth_smallest_element(x, n, reduced_dim, name=None):
+  return -nth_largest_element(-x, n, reduced_dim, name=name)

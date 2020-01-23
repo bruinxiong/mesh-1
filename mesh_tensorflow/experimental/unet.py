@@ -25,7 +25,7 @@ import os
 
 import mesh_tensorflow as mtf
 import numpy as np
-import tensorflow as tf  # tf
+import tensorflow.compat.v1 as tf  # tf
 
 # pylint: disable=g-direct-tensorflow-import,g-direct-third-party-import
 from mesh_tensorflow.experimental import data_aug_lib
@@ -268,7 +268,7 @@ def get_dataset_creator(dataset_str):
 
     if dataset_str == 'eval' and FLAGS.sampled_2d_slices:
       # When evaluating on slices, unbatch slices that belong to one CT scan.
-      dataset = dataset.apply(tf.data.experimental.unbatch())
+      dataset = dataset.unbatch()
 
     return dataset
 

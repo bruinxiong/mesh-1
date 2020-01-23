@@ -22,7 +22,7 @@ import mesh_tensorflow as mtf
 
 from six.moves import xrange  # pylint: disable=redefined-builtin
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class UtilsTest(tf.test.TestCase):
@@ -50,4 +50,5 @@ class UtilsTest(tf.test.TestCase):
 
 
 if __name__ == '__main__':
+  tf.disable_v2_behavior()
   tf.test.main()

@@ -27,9 +27,9 @@ from mesh_tensorflow import tpu_variables
 from mesh_tensorflow import utils
 from six.moves import xrange  # pylint: disable=redefined-builtin
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
-from tensorflow.contrib.tpu.python.ops import tpu_ops
+from tensorflow.python.tpu.ops import tpu_ops  # pylint: disable=g-direct-tensorflow-import
 
 
 class SimdMeshImpl(mtf.MeshImpl):
@@ -49,8 +49,8 @@ class SimdMeshImpl(mtf.MeshImpl):
       shape: an input to mtf.convert_to_shape()
       layout: an input to mtf.convert_to_layout_rules()
       devices: deprecated
-      device_assignment: a tf.contrib.tpu.DeviceAssignment - devices must be
-        asssigned in lexicographic order
+      device_assignment: a tf.tpu.experimental.DeviceAssignment -
+        devices must be asssigned in lexicographic order
       logical_to_physical: an optional permutation representing the mapping
         from logical cores to "physical" cores, where the physical cores are
         listed in lexicographic order in the physical mesh, and the logical
@@ -164,20 +164,30 @@ class SimdMeshImpl(mtf.MeshImpl):
       for physical_pnum in xrange(mesh_impl.size):
         slice_var_name = base_name + "_slice_%d" % physical_pnum
         # Use tf.Variable instead of tf.get_variable since latter adds lots of
-        # useless operations to the TF graph.
+        # useless operations to the TF graph. Use tf.get_variable only if
+        # in a AUTO_REUSE scope.
         # Note: Repeatedly 'with tf.device():' slows down the graph
         # construction. Therefore we directly use the cached device_stack here.
         tf.get_default_graph()._device_function_stack = (
             mesh_impl.graph_device_function_stacks[physical_pnum])
 
-        slices.append(
-            tf.Variable(
-                initial_value=zero_tensor,
-                trainable=True,
-                collections=["TPU_VAR"],
-                dtype=variable.slice_dtype,
-                name=slice_var_name,
-                expected_shape=slice_shape))
+        if tf.get_variable_scope().reuse == tf.AUTO_REUSE:
+          slice_var = tf.get_variable(
+              initializer=zero_tensor,
+              trainable=self._variable.trainable,
+              collections=["TPU_VAR"],
+              dtype=variable.slice_dtype,
+              name=slice_var_name)
+        else:
+          slice_var = tf.Variable(
+              initial_value=zero_tensor,
+              trainable=self._variable.trainable,
+              collections=["TPU_VAR"],
+              dtype=variable.slice_dtype,
+              name=slice_var_name,
+              expected_shape=slice_shape)
+
+        slices.append(slice_var)
 
       # Restore the initial stack
       tf.get_default_graph()._device_function_stack = init_device_stack

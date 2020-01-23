@@ -23,12 +23,12 @@ from absl.testing import parameterized
 import mesh_tensorflow as mtf
 import mesh_tensorflow.experimental.input_reader as input_reader
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 # pylint: disable=g-direct-tensorflow-import
-from tensorflow.contrib import tpu
-from tensorflow.contrib.tpu.python.tpu import device_assignment
 from tensorflow.core.protobuf.tpu import topology_pb2
+from tensorflow.python.tpu import device_assignment
+from tensorflow.python.tpu import tpu
 
 
 class MtfInputReaderTest(parameterized.TestCase, tf.test.TestCase):
@@ -64,8 +64,7 @@ class MtfInputReaderTest(parameterized.TestCase, tf.test.TestCase):
                              [self.sub_batch_created_times * 2, 0],
                              [2, 4])
         self.sub_batch_created_times += 1
-        return tf.data.Dataset.from_tensors(sub_batch).repeat().apply(
-            tf.data.experimental.unbatch())
+        return tf.data.Dataset.from_tensors(sub_batch).repeat().unbatch()
 
       batch_dim = mtf.Dimension("batch", batch_io_dim)
       io_dim = mtf.Dimension("io", batch_io_dim)

@@ -22,7 +22,7 @@ from __future__ import print_function
 import mesh_tensorflow as mtf
 import mesh_tensorflow.auto_mtf  # pylint: disable=unused-import
 import mesh_tensorflow.auto_mtf.api
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class LayoutTest(tf.test.TestCase):
@@ -135,4 +135,5 @@ class LayoutTest(tf.test.TestCase):
 
 
 if __name__ == "__main__":
+  tf.disable_v2_behavior()
   tf.test.main()

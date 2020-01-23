@@ -19,25 +19,31 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
+
 from mesh_tensorflow import ops_with_redefined_builtins as mtf
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
-def dense(x, output_dim, reduced_dims=None, expert_dims=None,
-          use_bias=True, activation=None,
+def dense(x,
+          new_dims,
+          reduced_dims=None,
+          expert_dims=None,
+          use_bias=True,
+          activation=None,
           master_dtype=tf.float32,
           slice_dtype=tf.float32,
           variable_dtype=None,
+          kernel_initializer=None,
           name=None):
   """Dense layer doing (kernel*x + bias) computation.
 
   Args:
     x: a mtf.Tensor of shape [..., reduced_dims].
-    output_dim: a mtf.Dimension
-      alternatively, a list of mtf.Dimension
-    reduced_dims: an optional list of mtf.Dimensions of x to be reduced. If
-      omitted, we reduce the last dimension.
+    new_dims: a list of mtf.Dimension.
+    reduced_dims: a list of mtf.Dimensions of x to be reduced.
+      If omitted (deprecated interface), we reduce the last dimension.
     expert_dims: an optional list of mtf.Dimension which represent different
       experts. Different experts get different weights.
     use_bias: a boolean, whether to add bias.
@@ -45,32 +51,50 @@ def dense(x, output_dim, reduced_dims=None, expert_dims=None,
     master_dtype: a tf.dtype (deprecated - use variable_dtype)
     slice_dtype: a tf.dtype (deprecated - use variable_dtype)
     variable_dtype: a mtf.VariableDType
+    kernel_initializer: an initializer for kernel variable.
     name: a string used for tf.variable_scope.
 
   Returns:
-    a mtf.Tensor of shape [..., output_dim].
+    a mtf.Tensor of shape [..., new_dims].
   """
-  if isinstance(output_dim, list):
-    output_dims = output_dim
-  else:
-    output_dims = [output_dim]
+  if not isinstance(new_dims, list):
+    new_dims = [new_dims]
+
   if variable_dtype is None:
     variable_dtype = mtf.VariableDType(master_dtype, slice_dtype, x.dtype)
   if expert_dims is None:
     expert_dims = []
   if reduced_dims is None:
+    tf.logging.warning(
+        "Deprecation warning - it is recommended to pass reduced_dims "
+        "explicitly to mtf.layers.dense() so as not to depend on dimension "
+        "order. To silence this warning, explicitly pass "
+        "reduced_dims=x.shape.dims[-1:] (in scope %s)"
+        %  tf.get_variable_scope().name)
     reduced_dims = x.shape.dims[-1:]
-  w_shape = mtf.Shape(expert_dims + reduced_dims + output_dims)
-  output_shape = mtf.Shape(
-      [d for d in x.shape.dims if d not in reduced_dims] + output_dims)
-
+  # if any reduced dims have the same names as new dims, first change these
+  #  dimension names in the input so as to avoid name conflict in the weight
+  #  matrix.
+  reduced_dims = reduced_dims[:]
+  for i in range(len(reduced_dims)):
+    if reduced_dims[i] in new_dims:
+      original_name = reduced_dims[i].name
+      tmp_name = "_" + original_name
+      reduced_dims[i] = mtf.Dimension(tmp_name, reduced_dims[i].size)
+      x = mtf.rename_dimension(x, original_name, tmp_name)
+  w_shape = mtf.Shape(expert_dims + reduced_dims + new_dims)
+  output_shape = mtf.Shape([d for d in x.shape.dims if d not in reduced_dims] +
+                           new_dims)
   with tf.variable_scope(name, default_name="dense"):
-    stddev = mtf.list_product(d.size for d in reduced_dims) ** -0.5
+    if kernel_initializer is None:
+      kernel_initializer = VarianceScalingInitializer()
+    if isinstance(kernel_initializer, DenseInitializer):
+      kernel_initializer = kernel_initializer(reduced_dims, new_dims)
     w = mtf.get_variable(
         x.mesh,
         "kernel",
         w_shape,
-        initializer=tf.random_normal_initializer(stddev=stddev),
+        initializer=kernel_initializer,
         dtype=variable_dtype)
     w = mtf.cast(w, x.dtype)
     y = mtf.einsum([x, w], output_shape)
@@ -78,13 +102,129 @@ def dense(x, output_dim, reduced_dims=None, expert_dims=None,
       b = mtf.get_variable(
           x.mesh,
           "bias",
-          mtf.Shape(expert_dims + output_dims),
+          mtf.Shape(expert_dims + new_dims),
           initializer=tf.zeros_initializer(),
           dtype=variable_dtype)
       y += b
     if activation is not None:
       y = activation(y)
     return y
+
+
+def dense_product(x,
+                  reduced_dims,
+                  new_dims,
+                  activation_functions=None,
+                  name="dense_product",
+                  **kwargs):
+  """Component-wise product of multiple dense layers.
+
+  e.g. if activation_functions=["linear", "sigmoid"], then this implements
+  Gated Linear Units https://arxiv.org/pdf/1612.08083.pdf
+
+  Args:
+    x: a Tensor
+    reduced_dims: a list of Dimensions.
+    new_dims: a list of Dimensions.
+    activation_functions: a list of activation functions (or a singleton)
+      Each can be a either:
+        - a callable function from Tensor to Tensor
+        - a string function name from namespace mtf)
+        - None or "linear", meaning no activation function
+    name: an optional string
+    **kwargs: additional kwargs for mtf.layers.dense()
+  """
+  if not isinstance(activation_functions, list):
+    activation_functions = [activation_functions]
+  num_factors = len(activation_functions)
+  factors = []
+  for i, activation in enumerate(activation_functions):
+    if activation == "linear":
+      activation = None
+    elif isinstance(activation, str):
+      activation = getattr(mtf, activation)
+    factors.append(
+        dense(x,
+              reduced_dims=reduced_dims,
+              new_dims=new_dims,
+              activation=activation,
+              name="%s_%d" % (name, i) if num_factors > 1 else name,
+              **kwargs))
+  return functools.reduce(mtf.multiply, factors)
+
+
+class DenseInitializer(object):
+  """Initializer that can be passed to dense().
+
+  The __call__ function takes reduced_dims and new_dims and returns a
+  tf initializer class.
+  """
+
+  def __call__(self, reduced_dims, new_dims):
+    raise NotImplementedError("not implemented")
+
+
+class VarianceScalingInitializer(DenseInitializer):
+  """Initializer capable of adapting its scale to the shape of weights.
+
+  With `distribution="normal"`, samples are drawn from a truncated normal
+  distribution centered on zero, with `stddev = sqrt(scale / n)` where n is:
+
+      - number of input units in the weight tensor, if mode = "fan_in"
+      - number of output units, if mode = "fan_out"
+      - average of the numbers of input and output units, if mode = "fan_avg"
+
+  With `distribution="uniform"`,
+  samples are drawn from a uniform distribution
+  within [-limit, limit], with `limit = sqrt(3 * scale / n)`.
+
+  # Arguments
+      scale: Scaling factor (positive float).
+      mode: One of "fan_in", "fan_out", "fan_avg".
+      distribution: Random distribution to use. One of "normal", "uniform".
+      seed: A Python integer. Used to seed the random generator.
+
+  # Raises
+      ValueError: In case of an invalid value for the "scale", mode" or
+        "distribution" arguments.
+  """
+
+  def __init__(self, scale=1.0,
+               mode="fan_in",
+               distribution="normal"):
+    if scale <= 0.:
+      raise ValueError("`scale` must be a positive float. Got:", scale)
+    mode = mode.lower()
+    if mode not in {"fan_in", "fan_out", "fan_avg"}:
+      raise ValueError(
+          "Invalid `mode` argument: "
+          "expected on of {\"fan_in\", \"fan_out\", \"fan_avg\"} "
+          "but got %s" % (mode,))
+    distribution = distribution.lower()
+    if distribution not in {"normal", "uniform"}:
+      raise ValueError("Invalid `distribution` argument: "
+                       "expected one of {\"normal\", \"uniform\"} "
+                       "but got %s" % (distribution,))
+    self.scale = scale
+    self.mode = mode
+    self.distribution = distribution
+
+  def __call__(self, reduced_dims, new_dims):
+    fan_in = mtf.list_product(d.size for d in reduced_dims)
+    fan_out = mtf.list_product(d.size for d in new_dims)
+    scale = self.scale
+    if self.mode == "fan_in":
+      scale /= max(1., fan_in)
+    elif self.mode == "fan_out":
+      scale /= max(1., fan_out)
+    else:
+      scale /= max(1., float(fan_in + fan_out) / 2)
+    stddev = scale ** 0.5
+    if self.distribution == "truncated_normal":
+      return tf.truncated_normal_initializer(stddev=stddev)
+    else:
+      limit = stddev * 3. ** 0.5
+      return tf.random_uniform_initializer(minval=-limit, maxval=limit)
 
 
 def conv2d(x, output_dim, filter_size=(3, 3),
@@ -627,6 +767,19 @@ def batch_norm(x, is_training, momentum, epsilon=1e-9,
 def softmax_cross_entropy_with_logits(logits, targets, vocab_dim, z_loss=0.0):
   """Per-example softmax loss.
 
+  `logits` is a Tensor with floating-point dtype, containing the predicted
+  relative log probabilities of the classes.
+
+  Either hard targets or soft targets are supported.
+
+  In the case of hard targets, `targets` is a Tensor with integer dtype whose
+  values are in the range [0, vocab_dim.size).  `targets` should have the same
+  set of dimensions as `logits`, but without `vocab_dim`.
+
+  In the case of soft targets, `targets` is a Tensor with floating point dtype
+  and the same dimensions as `logits.  Reducing `targets` along `vocab_dim`
+  should result in all ones.
+
   if z_loss is nonzero, we add a loss equal to z_loss*log(z)^2, where z is the
   partition function.  Example value: z_loss=1e-4.  Two uses of z_loss are:
   - To keep the logits from drifting too far from zero, which can cause
@@ -635,7 +788,7 @@ def softmax_cross_entropy_with_logits(logits, targets, vocab_dim, z_loss=0.0):
 
   Args:
     logits: a mtf.Tensor whose shape contains vocab_dim
-    targets: a mtf.Tensor with the same shape as logits
+    targets: a mtf.Tensor representing hard or soft targets (see comments)
     vocab_dim: a mtf.Dimension
     z_loss: a float
 
@@ -645,10 +798,19 @@ def softmax_cross_entropy_with_logits(logits, targets, vocab_dim, z_loss=0.0):
   Raises:
     ValueError: if the shapes do not match.
   """
-  if logits.shape != targets.shape:
+  if targets.dtype.is_integer:
+    # hard targets
+    if (set(targets.shape.dims)
+        != set(logits.shape.dims).difference([vocab_dim])):
+      raise ValueError(
+          "softmax_cross_entropy_with_logits with hard targets "
+          "dims in targets=%s should be dims in logits=%s other than "
+          "vocab_dim=%s" % (targets, logits, vocab_dim))
+    targets = mtf.one_hot(targets, vocab_dim, dtype=logits.dtype)
+  elif set(targets.shape.dims) != set(logits.shape.dims):
     raise ValueError(
-        "logits shape must equal targets shape"
-        "logits=%s targets=%s" % (logits.to_string, targets.to_string))
+        "softmax_cross_entropy_with_logits with soft targets "
+        "dims in targets=%s should be dims in logits=%s"% (targets, logits))
   if vocab_dim not in logits.shape.dims:
     raise ValueError("vocab_dim must be in logits.shape.dims")
   log_z = mtf.reduce_logsumexp(logits, vocab_dim)
@@ -1576,14 +1738,20 @@ def compress_mean(x, dim, compression_factor):
   return x
 
 
-def embedding_weights(
-    mesh, vocab_dim, output_dim, variable_dtype, name="embedding",
-    ensemble_dim=None):
+def embedding_weights(mesh,
+                      vocab_dim,
+                      output_dim,
+                      variable_dtype,
+                      name="embedding",
+                      ensemble_dim=None,
+                      initializer=None):
+  """Embedding weights."""
   shape = mtf.Shape(
       [ensemble_dim] if ensemble_dim else []) + [vocab_dim, output_dim]
+  if initializer is None:
+    initializer = tf.random_normal_initializer()
   ret = mtf.get_variable(
-      mesh, name, shape,
-      dtype=variable_dtype, initializer=tf.random_normal_initializer())
+      mesh, name, shape, dtype=variable_dtype, initializer=initializer)
   return ret
 
 

@@ -22,7 +22,7 @@ from __future__ import print_function
 from absl.testing import parameterized
 
 import mesh_tensorflow as mtf
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class SimdMeshImplTest(parameterized.TestCase):
@@ -60,4 +60,5 @@ class SimdMeshImplTest(parameterized.TestCase):
 
 
 if __name__ == "__main__":
+  tf.disable_v2_behavior()
   tf.test.main()

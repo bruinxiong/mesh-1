@@ -25,7 +25,7 @@ import random
 from mesh_tensorflow import ops_with_redefined_builtins as mtf
 from six.moves import xrange  # pylint: disable=redefined-builtin
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class PlacementMeshImpl(mtf.MeshImpl):

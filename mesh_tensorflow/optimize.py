@@ -23,7 +23,7 @@ from __future__ import print_function
 import re
 import gin
 from mesh_tensorflow import ops_with_redefined_builtins as mtf
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 def make_optimizer(hparams, lr):
@@ -178,7 +178,7 @@ class AdamWeightDecayOptimizer(Optimizer):
     # with the m/v parameters. This is equivalent to adding the square
     # of the weights to the loss with plain (non-momentum) SGD.
     if self._do_use_weight_decay(var.name):
-      update += self.weight_decay_rate * var
+      update += self.weight_decay_rate * var.value
 
     update_with_lr = self.learning_rate * update
 

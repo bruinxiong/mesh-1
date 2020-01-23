@@ -23,7 +23,7 @@ from absl.testing import parameterized
 import mesh_tensorflow as mtf
 from mesh_tensorflow.auto_mtf import graph_interface
 from mesh_tensorflow.auto_mtf import scheduler
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class SchedulerTest(parameterized.TestCase, tf.test.TestCase):
@@ -128,4 +128,5 @@ class SchedulerTest(parameterized.TestCase, tf.test.TestCase):
 
 
 if __name__ == '__main__':
+  tf.disable_v2_behavior()
   tf.test.main()

@@ -90,7 +90,7 @@ from __future__ import print_function
 import collections
 import os
 import gin
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 import tensorflow_datasets as tfds
 
 
@@ -217,7 +217,7 @@ def sample_from_text_line_datasets(glob_weight_list,
       tf.data.TextLineDataset(tf.gfile.Glob(g)).repeat().shuffle(
           shuffle_buffer_size).prefetch(prefetch) for g in globs
   ]
-  return tf.contrib.data.sample_from_datasets(
+  return tf.data.experimental.sample_from_datasets(
       datasets=datasets, weights=weights)
 
 
@@ -265,8 +265,10 @@ def packed_parallel_tsv_dataset(dataset=gin.REQUIRED,
       targets_enc = tf.concat([tf.to_int64(targets_enc), [eos_id]], 0)
     return {"inputs": inputs_enc, "targets": targets_enc}
 
-  dataset = dataset.map(_parse_fn)
-  dataset = dataset.map(_encode_fn, num_parallel_calls=16)
+  dataset = dataset.map(
+      _parse_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  dataset = dataset.map(
+      _encode_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
 
   def _filter_fn(features):  # pylint: disable=missing-docstring
     return tf.less_equal(
@@ -406,18 +408,13 @@ def pretokenized_tfrecord_dataset(filenames,
   keys = ["targets"] if text2self else ["inputs", "targets"]
   def decode_example(serialized_example):
     """Return a dict of Tensors from a serialized tensorflow.Example."""
-    data_fields = {}
-    data_items_to_decoders = {}
-    for k in keys:
-      data_fields[k] = tf.VarLenFeature(tf.int64)
-      data_items_to_decoders[k] = tf.contrib.slim.tfexample_decoder.Tensor(k)
-    decoder = tf.contrib.slim.tfexample_decoder.TFExampleDecoder(
-        data_fields, data_items_to_decoders)
-    decode_items = list(sorted(data_items_to_decoders))
-    decoded = decoder.decode(serialized_example, items=decode_items)
+    decoded = tf.io.parse_example(
+        serialized=[serialized_example],
+        features={k: tf.VarLenFeature(tf.int64) for k in keys})
+    decoded = {k: v.values for k, v in decoded.items()}
     if not eos_included:
-      decoded = [tf.concat([v, [1]], 0) for v in decoded]
-    return dict(zip(decode_items, decoded))
+      decoded = {k: tf.concat([v, [1]], 0) for k, v in decoded.items()}
+    return decoded
   dataset = dataset.map(decode_example,
                         num_parallel_calls=tf.data.experimental.AUTOTUNE)
   return pack_or_pad(dataset, sequence_length)
@@ -546,7 +543,7 @@ def pack_dataset(dataset, length, keys=None, use_custom_ops=False):
   # Set the Tensor shapes correctly since they get lost in the process.
   def my_fn(x):
     return {k: tf.reshape(v, [length[k]]) for k, v in x.items()}
-  return dataset.map(my_fn)
+  return dataset.map(my_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
 
 
 def _pack_with_tf_ops(dataset, keys, length):

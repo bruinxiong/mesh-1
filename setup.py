@@ -5,31 +5,36 @@ from setuptools import setup
 
 setup(
     name='mesh-tensorflow',
-    version='0.0.5',
+    version='0.1.9',
     description='Mesh TensorFlow',
     author='Google Inc.',
     author_email='no-reply@google.com',
     url='http://github.com/tensorflow/mesh',
     license='Apache 2.0',
     packages=find_packages(),
-    package_data={},
+    package_data={
+        # Include gin files.
+        'transformer': ['transformer/gin/*.gin'],
+    },
     scripts=[],
     install_requires=[
+        'absl-py',
         'future',
         'gin-config',
         'six',
     ],
     extras_require={
-        'auto_mtf': ['ortools>=7.0.6546'],
-        'tensorflow': ['tensorflow>=1.9.0'],
-        'tensorflow_gpu': ['tensorflow-gpu>=1.9.0'],
-        'tests': [
-            'absl-py',
-            'pytest',
-            'ortools>=7.0.6546',
-            'tensor2tensor>=1.9.0',  # TODO(trandustin): rm dependence
-        ],
+        'auto_mtf': ['ortools'],
+        'tensorflow': ['tensorflow>=1.15.0'],
+        'transformer': ['tensorflow-datasets'],
     },
+    tests_require=[
+        'ortools',
+        'pytest',
+        'tensorflow',
+        'tensorflow-datasets',
+    ],
+    setup_requires=['pytest-runner'],
     classifiers=[
         'Development Status :: 4 - Beta',
         'Intended Audience :: Developers',

@@ -34,7 +34,7 @@ import importlib
 import os
 import sys
 from mesh_tensorflow.transformer import utils
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 tf.flags.DEFINE_string(
     "tpu_job_name", None,
@@ -96,5 +96,6 @@ def main(_):
 
 
 if __name__ == "__main__":
+  tf.disable_v2_behavior()
   tf.logging.set_verbosity(tf.logging.INFO)
   tf.app.run()

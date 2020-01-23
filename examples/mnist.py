@@ -24,7 +24,7 @@ from __future__ import print_function
 
 import mesh_tensorflow as mtf
 import mnist_dataset as dataset  # local file import
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 tf.flags.DEFINE_string("data_dir", "/tmp/mnist_data",
@@ -234,5 +234,6 @@ def main(_):
 
 
 if __name__ == "__main__":
+  tf.disable_v2_behavior()
   tf.logging.set_verbosity(tf.logging.INFO)
   tf.app.run()

@@ -15,7 +15,7 @@ function set_status() {
 }
 
 # Run tests
-pytest
+python setup.py test
 set_status
 
 exit $STATUS

@@ -21,7 +21,7 @@ from __future__ import print_function
 
 import mesh_tensorflow as mtf
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 def attention(q,
@@ -74,6 +74,8 @@ def attention(q,
   outputs_shape = q.shape - key_dim + value_dim
   outputs = mtf.einsum([weights, v], outputs_shape)
   return outputs
+
+
 
 
 class AttentionParams(object):
